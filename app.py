@@ -24,7 +24,6 @@ st.set_page_config(
 # 工具函式：圖片轉 Bytes 與安全執行 SymPy
 # -----------------------------------------------------------------------------
 def image_to_bytes(img: Image.Image) -> bytes:
-    """確保圖片轉為標準 RGB JPEG bytes，避免 PIL 物件相容性問題"""
     if img.mode != "RGB":
         img = img.convert("RGB")
     buf = io.BytesIO()
@@ -65,28 +64,22 @@ def execute_sympy_code(code_str: str) -> dict:
         }
 
 # -----------------------------------------------------------------------------
-# 動態模型選擇 (自動匹配可用模型)
+# 優先採用 Google 官方推薦之 gemini-3.8-flash
 # -----------------------------------------------------------------------------
 def get_best_model(client: genai.Client) -> str:
-    """自動從帳號支援的可用模型中挑選最佳 Flash 模型"""
     candidate_names = [
+        "gemini-3.8-flash",
         "gemini-2.0-flash",
         "gemini-2.5-flash",
-        "gemini-1.5-flash",
-        "gemini-2.0-flash-exp",
     ]
     try:
         available_models = [m.name.replace("models/", "") for m in client.models.list()]
         for cand in candidate_names:
             if cand in available_models:
                 return cand
-        # 若清單中有包含 flash 關鍵字的模型則取第一個
-        flash_models = [m for m in available_models if "flash" in m]
-        if flash_models:
-            return flash_models[0]
     except Exception:
         pass
-    return "gemini-2.0-flash"
+    return "gemini-3.8-flash"
 
 # -----------------------------------------------------------------------------
 # Multi-Agent 核心邏輯
@@ -194,7 +187,6 @@ if "study_kit" not in st.session_state:
 if "current_image" not in st.session_state:
     st.session_state.current_image = None
 
-# 從 Secrets 或環境變數獲取 API Key
 env_key = ""
 try:
     env_key = st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY", ""))
@@ -207,7 +199,7 @@ with st.sidebar:
         "Gemini API Key",
         value=env_key,
         type="password",
-        help="輸入來自 aistudio.google.com 的 API Key (通常以 AIzaSy 開頭)",
+        help="輸入來自 aistudio.google.com 的 API Key",
     )
     if api_key:
         st.success("✅ API Key 已輸入")
@@ -245,7 +237,6 @@ if not api_key:
     st.warning("⚠️ 請在左側輸入或在 Streamlit Secrets 設定你的 **Gemini API Key**！")
     st.stop()
 
-# 初始化 Client 與確認可用模型
 try:
     client = genai.Client(api_key=api_key)
     active_model = get_best_model(client)
@@ -256,7 +247,6 @@ except Exception as e:
 
 col_chat, col_tools = st.columns([6, 4])
 
-# 右欄：後台驗算記錄與延伸教材
 with col_tools:
     st.subheader("🛠️ 後台多代理人監控與學習套件")
     
@@ -299,7 +289,6 @@ with col_tools:
     else:
         st.caption("👈 上傳題目並發送第一則訊息後，此處將顯示後台驗算與生成之教材模組。")
 
-# 左欄：對話介面
 with col_chat:
     st.subheader("💬 蘇格拉底解題對話")
     
@@ -342,4 +331,3 @@ with col_chat:
 
         except Exception as e:
             st.error(f"⚠️ 發生錯誤：{e}")
-            st.info("若錯誤代碼為 API_KEY_INVALID，請確認左側側邊欄是否已輸入正確的 API Key。")
