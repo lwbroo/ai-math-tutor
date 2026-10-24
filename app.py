@@ -3,6 +3,7 @@ import json
 import os
 import re
 import sys
+import time
 from contextlib import redirect_stdout
 from PIL import Image
 import streamlit as st
@@ -21,13 +22,19 @@ st.set_page_config(
 )
 
 # -----------------------------------------------------------------------------
-# 工具函式：圖片轉 Bytes 與安全執行 SymPy
+# 工具函式：圖片壓縮與安全執行 SymPy
 # -----------------------------------------------------------------------------
-def image_to_bytes(img: Image.Image) -> bytes:
+def optimize_image(img: Image.Image, max_dim: int = 1280) -> bytes:
     if img.mode != "RGB":
         img = img.convert("RGB")
+    w, h = img.size
+    if max(w, h) > max_dim:
+        scale = max_dim / max(w, h)
+        new_w, new_h = int(w * scale), int(h * scale)
+        img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=90)
+    img.save(buf, format="JPEG", quality=85)
     return buf.getvalue()
 
 def execute_sympy_code(code_str: str) -> dict:
@@ -64,27 +71,43 @@ def execute_sympy_code(code_str: str) -> dict:
         }
 
 # -----------------------------------------------------------------------------
-# 優先採用 Google 官方推薦之 gemini-3.8-flash
+# 彈性呼叫 API：防範 503 塞車與模型自動熱備份
 # -----------------------------------------------------------------------------
-def get_best_model(client: genai.Client) -> str:
-    candidate_names = [
-        "gemini-3.8-flash",
-        "gemini-2.0-flash",
-        "gemini-2.5-flash",
-    ]
-    try:
-        available_models = [m.name.replace("models/", "") for m in client.models.list()]
-        for cand in candidate_names:
-            if cand in available_models:
-                return cand
-    except Exception:
-        pass
-    return "gemini-3.8-flash"
+FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-2.0-flash", "gemini-2.5-flash"]
+
+def generate_content_with_retry(client: genai.Client, primary_model: str, contents, config=None, max_retries=3):
+    """
+    遇到 503 High Demand 時：
+    1. 優先在原模型重試 2 次 (間隔 1.5s, 3s)
+    2. 若持續 503，自動切換至備用模型
+    """
+    models_to_try = [primary_model] + [m for m in FALLBACK_MODELS if m != primary_model]
+    last_err = None
+
+    for m in models_to_try:
+        for attempt in range(max_retries):
+            try:
+                return client.models.generate_content(model=m, contents=contents, config=config)
+            except Exception as e:
+                last_err = e
+                err_msg = str(e)
+                # 若為 503 High Demand 或暫時性錯誤，等待後重試
+                if "503" in err_msg or "UNAVAILABLE" in err_msg or "high demand" in err_msg.lower():
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                else:
+                    # 其他錯誤則直接嘗試下一位模型
+                    break
+    raise last_err
 
 # -----------------------------------------------------------------------------
 # Multi-Agent 核心邏輯
 # -----------------------------------------------------------------------------
-def run_front_desk_and_solver(client: genai.Client, model_name: str, image: Image.Image, user_query: str):
+def run_front_desk_and_solver(client: genai.Client, model_name: str, image: Image.Image, user_query: str, status_box):
+    status_box.write("📸 正在壓縮與分析題目幾何圖形...")
+    img_bytes = optimize_image(image)
+    image_part = types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg")
+
     solver_prompt = f"""
 你是由兩位專家組成的後台核心：
 1. 【櫃檯專家】：請仔細辨識題目圖片與使用者的指示「{user_query}」，提取所有幾何條件、已知數據與欲求目標。
@@ -103,11 +126,10 @@ def run_front_desk_and_solver(client: genai.Client, model_name: str, image: Imag
 }}
 重要：請直接輸出 JSON 物件，不要包在任何額外的解釋文字中。
 """
-    img_bytes = image_to_bytes(image)
-    image_part = types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg")
-
-    response = client.models.generate_content(
-        model=model_name,
+    status_box.write("🧠 正在編寫 Python 驗算算式...")
+    response = generate_content_with_retry(
+        client=client,
+        primary_model=model_name,
         contents=[image_part, solver_prompt],
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
@@ -116,6 +138,7 @@ def run_front_desk_and_solver(client: genai.Client, model_name: str, image: Imag
     )
 
     data = json.loads(response.text)
+    status_box.write("⚡ 正在本機 Python 沙盒執行 SymPy 方程求解...")
     execution_result = execute_sympy_code(data.get("python_code", ""))
     data["execution_result"] = execution_result
     return data
@@ -140,8 +163,9 @@ def socratic_tutor_step(client: genai.Client, model_name: str, history: list, so
         chat_contents.append(f"{h['role']}: {h['content']}")
     chat_contents.append(f"user: {latest_input}")
 
-    response = client.models.generate_content(
-        model=model_name,
+    response = generate_content_with_retry(
+        client=client,
+        primary_model=model_name,
         contents=chat_contents,
         config=types.GenerateContentConfig(
             system_instruction=system_instruction,
@@ -164,9 +188,11 @@ def generate_study_kit(client: genai.Client, model_name: str, solved_plan: dict)
         {{"front": "...", "back": "..."}}
     ]
 }}
+重要：請直接輸出合法 JSON，不要附帶額外說明。
 """
-    response = client.models.generate_content(
-        model=model_name,
+    response = generate_content_with_retry(
+        client=client,
+        primary_model=model_name,
         contents=[kit_prompt],
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
@@ -195,12 +221,7 @@ except Exception:
 
 with st.sidebar:
     st.title("⚙️ 系統設定")
-    api_key = st.text_input(
-        "Gemini API Key",
-        value=env_key,
-        type="password",
-        help="輸入來自 aistudio.google.com 的 API Key",
-    )
+    api_key = st.text_input("Gemini API Key", value=env_key, type="password")
     if api_key:
         st.success("✅ API Key 已輸入")
     st.markdown("---")
@@ -239,14 +260,15 @@ if not api_key:
 
 try:
     client = genai.Client(api_key=api_key)
-    active_model = get_best_model(client)
-    st.caption(f"🤖 目前核心模型：`{active_model}`")
+    active_model = "gemini-3.8-flash"
+    st.caption(f"🤖 目前核心模型：`{active_model}` (具備自動重試與熱備援)")
 except Exception as e:
     st.error(f"Client 初始化失敗: {e}")
     st.stop()
 
 col_chat, col_tools = st.columns([6, 4])
 
+# 右欄：後台驗算記錄與延伸教材
 with col_tools:
     st.subheader("🛠️ 後台多代理人監控與學習套件")
     
@@ -289,6 +311,7 @@ with col_tools:
     else:
         st.caption("👈 上傳題目並發送第一則訊息後，此處將顯示後台驗算與生成之教材模組。")
 
+# 左欄：對話介面
 with col_chat:
     st.subheader("💬 蘇格拉底解題對話")
     
@@ -296,7 +319,7 @@ with col_chat:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    if prompt := st.chat_input("請輸入你的回覆或提問（例如：請教我算這題 / 我不知道怎麼算...）"):
+    if prompt := st.chat_input("請輸入你的回覆或提問..."):
         if not st.session_state.current_image:
             st.warning("⚠️ 請先在左側上傳或拍下題目圖片！")
             st.stop()
@@ -307,13 +330,15 @@ with col_chat:
 
         try:
             if not st.session_state.solved_plan:
-                with st.spinner("🕵️ 後台解題專家正在驗算題意並執行 Python 算式中..."):
+                with st.status("🚀 正在啟動多代理人解題管線...", expanded=True) as status:
                     st.session_state.solved_plan = run_front_desk_and_solver(
                         client=client,
                         model_name=active_model,
                         image=st.session_state.current_image,
                         user_query=prompt,
+                        status_box=status,
                     )
+                    status.update(label="✅ 後台題目驗算與求解完成！", state="complete", expanded=False)
 
             with st.spinner("🤔 家教正在思考引導步驟..."):
                 reply = socratic_tutor_step(
