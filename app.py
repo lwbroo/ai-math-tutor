@@ -20,11 +20,12 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+MODEL_CANDIDATES = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+
 # -----------------------------------------------------------------------------
 # 安全執行 Python 驗算程式碼
 # -----------------------------------------------------------------------------
 def execute_sympy_code(code_str: str) -> dict:
-    """執行解題專家產生的 SymPy 驗算程式碼，捕捉 stdout 與變數。"""
     clean_code = re.sub(r"^```python\s*", "", code_str, flags=re.MULTILINE)
     clean_code = re.sub(r"^```\s*$", "", clean_code, flags=re.MULTILINE)
 
@@ -58,13 +59,20 @@ def execute_sympy_code(code_str: str) -> dict:
         }
 
 # -----------------------------------------------------------------------------
-# Multi-Agent 核心邏輯
+# Multi-Agent 核心邏輯 (含模型自動備援與完整錯誤顯示)
 # -----------------------------------------------------------------------------
+def call_gemini_with_fallback(client: genai.Client, contents, config=None):
+    """嘗試調用模型，若特定模型名稱不支援則自動降級"""
+    last_err = None
+    for m in MODEL_CANDIDATES:
+        try:
+            return client.models.generate_content(model=m, contents=contents, config=config)
+        except Exception as e:
+            last_err = e
+            continue
+    raise last_err
+
 def run_front_desk_and_solver(client: genai.Client, image: Image.Image, user_query: str):
-    """
-    Agent 1 (櫃檯) + Agent 2 (解題專家):
-    解析圖片題目 -> 撰寫 Python SymPy 程式碼驗算 -> 產出結構化解題步驟。
-    """
     solver_prompt = f"""
 你是由兩位專家組成的後台核心：
 1. 【櫃檯專家】：請仔細辨識題目圖片與使用者的指示「{user_query}」，提取所有幾何條件、已知數據與欲求目標。
@@ -83,8 +91,12 @@ def run_front_desk_and_solver(client: genai.Client, image: Image.Image, user_que
 }}
 重要：請直接輸出 JSON 物件，不要包在任何額外的解釋文字中。
 """
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
+    # 確保圖片轉成 RGB 格式避免 PNG RGBA 通道報錯
+    if image.mode != "RGB":
+        image = image.convert("RGB")
+
+    response = call_gemini_with_fallback(
+        client=client,
         contents=[image, solver_prompt],
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
@@ -98,10 +110,6 @@ def run_front_desk_and_solver(client: genai.Client, image: Image.Image, user_que
     return data
 
 def socratic_tutor_step(client: genai.Client, history: list, solved_plan: dict, latest_input: str):
-    """
-    Agent 3 (蘇格拉底家教):
-    嚴格依據驗算後的步驟引導學生，一次只問一小步，絕不給完整解答。
-    """
     system_instruction = f"""
 你是一位親切、有耐心的頂尖高中數學「蘇格拉底家教」。
 【後台驗證之標準解法資訊】：
@@ -121,8 +129,8 @@ def socratic_tutor_step(client: genai.Client, history: list, solved_plan: dict, 
         chat_contents.append(f"{h['role']}: {h['content']}")
     chat_contents.append(f"user: {latest_input}")
 
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
+    response = call_gemini_with_fallback(
+        client=client,
         contents=chat_contents,
         config=types.GenerateContentConfig(
             system_instruction=system_instruction,
@@ -132,7 +140,6 @@ def socratic_tutor_step(client: genai.Client, history: list, solved_plan: dict, 
     return response.text
 
 def generate_study_kit(client: genai.Client, solved_plan: dict):
-    """生成心智圖 (Mermaid) 與學習卡 (Flashcards)"""
     kit_prompt = f"""
 根據本題題型與幾何觀念（題目：{solved_plan.get('problem_statement')}）：
 1. 產出一段 Mermaid.js 心智圖代碼（以 graph TD 開頭），梳理此題涵蓋的核心公式、解題路徑與易錯陷阱。
@@ -147,8 +154,8 @@ def generate_study_kit(client: genai.Client, solved_plan: dict):
     ]
 }}
 """
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
+    response = call_gemini_with_fallback(
+        client=client,
         contents=[kit_prompt],
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
@@ -169,20 +176,19 @@ if "study_kit" not in st.session_state:
 if "current_image" not in st.session_state:
     st.session_state.current_image = None
 
-# 讀取環境變數中的 GEMINI_API_KEY 作為預設值
-env_key = os.getenv("GEMINI_API_KEY", "")
+# 讀取 Secrets 或環境變數
+env_key = st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY", ""))
 
-# 側邊欄設定
 with st.sidebar:
     st.title("⚙️ 系統設定")
     api_key = st.text_input(
         "Gemini API Key",
         value=env_key,
         type="password",
-        help="已自動載入終端機 export 的金鑰，亦可在此手動輸入。",
+        help="輸入來自 aistudio.google.com 的 API Key (通常以 AIzaSy 開頭)",
     )
     if api_key:
-        st.success("✅ API Key 已就緒")
+        st.success("✅ API Key 已載入")
     st.markdown("---")
     
     st.header("📸 題目影像輸入")
@@ -214,11 +220,14 @@ with st.sidebar:
 st.header("📐 數理蘇格拉底 AI 引導家教")
 
 if not api_key:
-    st.warning("⚠️ 請在左側輸入或 export 你的 **Gemini API Key**！")
+    st.warning("⚠️ 請在左側輸入或在 Streamlit Secrets 設定你的 **Gemini API Key**！")
     st.stop()
 
-# 自動使用配置好的 Key 初始化 Client
-client = genai.Client(api_key=api_key)
+try:
+    client = genai.Client(api_key=api_key)
+except Exception as e:
+    st.error(f"Client 初始化失敗: {e}")
+    st.stop()
 
 col_chat, col_tools = st.columns([6, 4])
 
@@ -243,7 +252,10 @@ with col_tools:
         st.markdown("---")
         if st.button("✨ 一鍵生成心智圖與觀念記憶卡", use_container_width=True):
             with st.spinner("AI 正在繪製 Mermaid 心智圖與生成記憶卡..."):
-                st.session_state.study_kit = generate_study_kit(client, st.session_state.solved_plan)
+                try:
+                    st.session_state.study_kit = generate_study_kit(client, st.session_state.solved_plan)
+                except Exception as e:
+                    st.error(f"生成失敗: {e}")
 
         if st.session_state.study_kit:
             kit = st.session_state.study_kit
@@ -279,23 +291,28 @@ with col_chat:
         with st.chat_message("user"):
             st.markdown(prompt)
 
-        if not st.session_state.solved_plan:
-            with st.spinner("🕵️ 後台解題專家正在驗算題意並執行 Python 算式中..."):
-                st.session_state.solved_plan = run_front_desk_and_solver(
+        try:
+            if not st.session_state.solved_plan:
+                with st.spinner("🕵️ 後台解題專家正在驗算題意並執行 Python 算式中..."):
+                    st.session_state.solved_plan = run_front_desk_and_solver(
+                        client=client,
+                        image=st.session_state.current_image,
+                        user_query=prompt,
+                    )
+
+            with st.spinner("🤔 家教正在思考引導步驟..."):
+                reply = socratic_tutor_step(
                     client=client,
-                    image=st.session_state.current_image,
-                    user_query=prompt,
+                    history=st.session_state.messages[:-1],
+                    solved_plan=st.session_state.solved_plan,
+                    latest_input=prompt,
                 )
 
-        with st.spinner("🤔 家教正在思考引導步驟..."):
-            reply = socratic_tutor_step(
-                client=client,
-                history=st.session_state.messages[:-1],
-                solved_plan=st.session_state.solved_plan,
-                latest_input=prompt,
-            )
+            with st.chat_message("assistant"):
+                st.markdown(reply)
+            st.session_state.messages.append({"role": "assistant", "content": reply})
+            st.rerun()
 
-        with st.chat_message("assistant"):
-            st.markdown(reply)
-        st.session_state.messages.append({"role": "assistant", "content": reply})
-        st.rerun()
+        except Exception as e:
+            st.error(f"⚠️ 發生錯誤：{e}")
+            st.info("提示：如果提示 API_KEY_INVALID，請前往 https://aistudio.google.com/app/apikey 重新取得以 'AIzaSy' 開頭的標準免費金鑰。")
