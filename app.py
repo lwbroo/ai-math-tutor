@@ -11,7 +11,7 @@ from google import genai
 from google.genai import types
 
 # -----------------------------------------------------------------------------
-# 頁面基本配置
+# 頁面配置
 # -----------------------------------------------------------------------------
 st.set_page_config(
     page_title="AI 數理蘇格拉底引導家教",
@@ -20,12 +20,17 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# 優先使用通用穩定模型
-PRIMARY_MODEL = "gemini-2.0-flash"
+# -----------------------------------------------------------------------------
+# 工具函式：圖片轉 Bytes 與安全執行 SymPy
+# -----------------------------------------------------------------------------
+def image_to_bytes(img: Image.Image) -> bytes:
+    """確保圖片轉為標準 RGB JPEG bytes，避免 PIL 物件相容性問題"""
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=90)
+    return buf.getvalue()
 
-# -----------------------------------------------------------------------------
-# 安全執行 Python 驗算程式碼
-# -----------------------------------------------------------------------------
 def execute_sympy_code(code_str: str) -> dict:
     clean_code = re.sub(r"^```python\s*", "", code_str, flags=re.MULTILINE)
     clean_code = re.sub(r"^```\s*$", "", clean_code, flags=re.MULTILINE)
@@ -60,9 +65,33 @@ def execute_sympy_code(code_str: str) -> dict:
         }
 
 # -----------------------------------------------------------------------------
+# 動態模型選擇 (自動匹配可用模型)
+# -----------------------------------------------------------------------------
+def get_best_model(client: genai.Client) -> str:
+    """自動從帳號支援的可用模型中挑選最佳 Flash 模型"""
+    candidate_names = [
+        "gemini-2.0-flash",
+        "gemini-2.5-flash",
+        "gemini-1.5-flash",
+        "gemini-2.0-flash-exp",
+    ]
+    try:
+        available_models = [m.name.replace("models/", "") for m in client.models.list()]
+        for cand in candidate_names:
+            if cand in available_models:
+                return cand
+        # 若清單中有包含 flash 關鍵字的模型則取第一個
+        flash_models = [m for m in available_models if "flash" in m]
+        if flash_models:
+            return flash_models[0]
+    except Exception:
+        pass
+    return "gemini-2.0-flash"
+
+# -----------------------------------------------------------------------------
 # Multi-Agent 核心邏輯
 # -----------------------------------------------------------------------------
-def run_front_desk_and_solver(client: genai.Client, image: Image.Image, user_query: str):
+def run_front_desk_and_solver(client: genai.Client, model_name: str, image: Image.Image, user_query: str):
     solver_prompt = f"""
 你是由兩位專家組成的後台核心：
 1. 【櫃檯專家】：請仔細辨識題目圖片與使用者的指示「{user_query}」，提取所有幾何條件、已知數據與欲求目標。
@@ -81,12 +110,12 @@ def run_front_desk_and_solver(client: genai.Client, image: Image.Image, user_que
 }}
 重要：請直接輸出 JSON 物件，不要包在任何額外的解釋文字中。
 """
-    if image.mode != "RGB":
-        image = image.convert("RGB")
+    img_bytes = image_to_bytes(image)
+    image_part = types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg")
 
     response = client.models.generate_content(
-        model=PRIMARY_MODEL,
-        contents=[image, solver_prompt],
+        model=model_name,
+        contents=[image_part, solver_prompt],
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
             temperature=0.2,
@@ -98,7 +127,7 @@ def run_front_desk_and_solver(client: genai.Client, image: Image.Image, user_que
     data["execution_result"] = execution_result
     return data
 
-def socratic_tutor_step(client: genai.Client, history: list, solved_plan: dict, latest_input: str):
+def socratic_tutor_step(client: genai.Client, model_name: str, history: list, solved_plan: dict, latest_input: str):
     system_instruction = f"""
 你是一位親切、有耐心的頂尖高中數學「蘇格拉底家教」。
 【後台驗證之標準解法資訊】：
@@ -119,7 +148,7 @@ def socratic_tutor_step(client: genai.Client, history: list, solved_plan: dict, 
     chat_contents.append(f"user: {latest_input}")
 
     response = client.models.generate_content(
-        model=PRIMARY_MODEL,
+        model=model_name,
         contents=chat_contents,
         config=types.GenerateContentConfig(
             system_instruction=system_instruction,
@@ -128,7 +157,7 @@ def socratic_tutor_step(client: genai.Client, history: list, solved_plan: dict, 
     )
     return response.text
 
-def generate_study_kit(client: genai.Client, solved_plan: dict):
+def generate_study_kit(client: genai.Client, model_name: str, solved_plan: dict):
     kit_prompt = f"""
 根據本題題型與幾何觀念（題目：{solved_plan.get('problem_statement')}）：
 1. 產出一段 Mermaid.js 心智圖代碼（以 graph TD 開頭），梳理此題涵蓋的核心公式、解題路徑與易錯陷阱。
@@ -144,7 +173,7 @@ def generate_study_kit(client: genai.Client, solved_plan: dict):
 }}
 """
     response = client.models.generate_content(
-        model=PRIMARY_MODEL,
+        model=model_name,
         contents=[kit_prompt],
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
@@ -165,7 +194,12 @@ if "study_kit" not in st.session_state:
 if "current_image" not in st.session_state:
     st.session_state.current_image = None
 
-env_key = st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY", ""))
+# 從 Secrets 或環境變數獲取 API Key
+env_key = ""
+try:
+    env_key = st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY", ""))
+except Exception:
+    env_key = os.getenv("GEMINI_API_KEY", "")
 
 with st.sidebar:
     st.title("⚙️ 系統設定")
@@ -173,10 +207,10 @@ with st.sidebar:
         "Gemini API Key",
         value=env_key,
         type="password",
-        help="自動載入自 Secrets 或環境變數",
+        help="輸入來自 aistudio.google.com 的 API Key (通常以 AIzaSy 開頭)",
     )
     if api_key:
-        st.success("✅ API Key 已就緒")
+        st.success("✅ API Key 已輸入")
     st.markdown("---")
     
     st.header("📸 題目影像輸入")
@@ -211,10 +245,18 @@ if not api_key:
     st.warning("⚠️ 請在左側輸入或在 Streamlit Secrets 設定你的 **Gemini API Key**！")
     st.stop()
 
-client = genai.Client(api_key=api_key)
+# 初始化 Client 與確認可用模型
+try:
+    client = genai.Client(api_key=api_key)
+    active_model = get_best_model(client)
+    st.caption(f"🤖 目前核心模型：`{active_model}`")
+except Exception as e:
+    st.error(f"Client 初始化失敗: {e}")
+    st.stop()
 
 col_chat, col_tools = st.columns([6, 4])
 
+# 右欄：後台驗算記錄與延伸教材
 with col_tools:
     st.subheader("🛠️ 後台多代理人監控與學習套件")
     
@@ -235,7 +277,10 @@ with col_tools:
         st.markdown("---")
         if st.button("✨ 一鍵生成心智圖與觀念記憶卡", use_container_width=True):
             with st.spinner("AI 正在繪製 Mermaid 心智圖與生成記憶卡..."):
-                st.session_state.study_kit = generate_study_kit(client, st.session_state.solved_plan)
+                try:
+                    st.session_state.study_kit = generate_study_kit(client, active_model, st.session_state.solved_plan)
+                except Exception as e:
+                    st.error(f"生成失敗: {e}")
 
         if st.session_state.study_kit:
             kit = st.session_state.study_kit
@@ -254,6 +299,7 @@ with col_tools:
     else:
         st.caption("👈 上傳題目並發送第一則訊息後，此處將顯示後台驗算與生成之教材模組。")
 
+# 左欄：對話介面
 with col_chat:
     st.subheader("💬 蘇格拉底解題對話")
     
@@ -270,23 +316,30 @@ with col_chat:
         with st.chat_message("user"):
             st.markdown(prompt)
 
-        if not st.session_state.solved_plan:
-            with st.spinner("🕵️ 後台解題專家正在驗算題意並執行 Python 算式中..."):
-                st.session_state.solved_plan = run_front_desk_and_solver(
+        try:
+            if not st.session_state.solved_plan:
+                with st.spinner("🕵️ 後台解題專家正在驗算題意並執行 Python 算式中..."):
+                    st.session_state.solved_plan = run_front_desk_and_solver(
+                        client=client,
+                        model_name=active_model,
+                        image=st.session_state.current_image,
+                        user_query=prompt,
+                    )
+
+            with st.spinner("🤔 家教正在思考引導步驟..."):
+                reply = socratic_tutor_step(
                     client=client,
-                    image=st.session_state.current_image,
-                    user_query=prompt,
+                    model_name=active_model,
+                    history=st.session_state.messages[:-1],
+                    solved_plan=st.session_state.solved_plan,
+                    latest_input=prompt,
                 )
 
-        with st.spinner("🤔 家教正在思考引導步驟..."):
-            reply = socratic_tutor_step(
-                client=client,
-                history=st.session_state.messages[:-1],
-                solved_plan=st.session_state.solved_plan,
-                latest_input=prompt,
-            )
+            with st.chat_message("assistant"):
+                st.markdown(reply)
+            st.session_state.messages.append({"role": "assistant", "content": reply})
+            st.rerun()
 
-        with st.chat_message("assistant"):
-            st.markdown(reply)
-        st.session_state.messages.append({"role": "assistant", "content": reply})
-        st.rerun()
+        except Exception as e:
+            st.error(f"⚠️ 發生錯誤：{e}")
+            st.info("若錯誤代碼為 API_KEY_INVALID，請確認左側側邊欄是否已輸入正確的 API Key。")
