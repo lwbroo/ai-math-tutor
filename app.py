@@ -1,3 +1,5 @@
+import base64
+from datetime import date
 import io
 import json
 import os
@@ -6,6 +8,7 @@ import sys
 import time
 from contextlib import redirect_stdout
 from PIL import Image
+import requests
 import streamlit as st
 import sympy as sp
 from google import genai
@@ -22,9 +25,10 @@ st.set_page_config(
 )
 
 # -----------------------------------------------------------------------------
-# 工具函式
+# 圖片處理與 SymPy 驗算沙盒
 # -----------------------------------------------------------------------------
-def optimize_image(img: Image.Image, max_dim: int = 1280) -> bytes:
+def optimize_image_base64(img: Image.Image, max_dim: int = 1280) -> tuple[bytes, str]:
+    """將圖片等比壓縮並產出 bytes 與 base64 字串"""
     if img.mode != "RGB":
         img = img.convert("RGB")
     w, h = img.size
@@ -32,9 +36,12 @@ def optimize_image(img: Image.Image, max_dim: int = 1280) -> bytes:
         scale = max_dim / max(w, h)
         new_w, new_h = int(w * scale), int(h * scale)
         img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+    
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=85)
-    return buf.getvalue()
+    raw_bytes = buf.getvalue()
+    b64_str = base64.b64encode(raw_bytes).decode("utf-8")
+    return raw_bytes, b64_str
 
 def execute_sympy_code(code_str: str) -> dict:
     clean_code = re.sub(r"^```python\s*", "", code_str, flags=re.MULTILINE)
@@ -49,33 +56,111 @@ def execute_sympy_code(code_str: str) -> dict:
     except Exception as e:
         return {"success": False, "stdout": stdout_capture.getvalue().strip(), "code": clean_code.strip(), "error": str(e)}
 
-FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-2.0-flash", "gemini-2.5-flash"]
+# -----------------------------------------------------------------------------
+# 跨平台 Multi-LLM 統一呼叫引擎 (Gemini / Grok / OpenAI)
+# -----------------------------------------------------------------------------
+def call_unified_llm(
+    provider: str,
+    api_key: str,
+    model_name: str,
+    system_prompt: str,
+    user_prompt: str,
+    image_b64: str = None,
+    image_bytes: bytes = None,
+    response_json: bool = False,
+) -> str:
+    """統一封裝 Google Gemini、xAI Grok 與 OpenAI 的請求"""
+    
+    # 1. Google Gemini 模式
+    if provider == "Google Gemini":
+        client = genai.Client(api_key=api_key)
+        contents = []
+        if image_bytes:
+            contents.append(types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"))
+        contents.append(user_prompt)
 
-def generate_content_with_retry(client: genai.Client, primary_model: str, contents, config=None, max_retries=3):
-    models_to_try = [primary_model] + [m for m in FALLBACK_MODELS if m != primary_model]
-    last_err = None
-    for m in models_to_try:
-        for attempt in range(max_retries):
+        cfg_args = {"temperature": 0.3}
+        if system_prompt:
+            cfg_args["system_instruction"] = system_prompt
+        if response_json:
+            cfg_args["response_mime_type"] = "application/json"
+
+        # 優先清單輪詢防 503/404
+        candidates = [model_name, "gemini-2.5-flash", "gemini-2.0-flash"]
+        last_err = None
+        for m in candidates:
             try:
-                return client.models.generate_content(model=m, contents=contents, config=config)
+                res = client.models.generate_content(
+                    model=m,
+                    contents=contents,
+                    config=types.GenerateContentConfig(**cfg_args),
+                )
+                return res.text
             except Exception as e:
                 last_err = e
-                err_msg = str(e)
-                if "503" in err_msg or "UNAVAILABLE" in err_msg or "high demand" in err_msg.lower():
-                    time.sleep(1.5 * (attempt + 1))
-                    continue
-                break
-    raise last_err
+                time.sleep(1)
+        raise last_err
+
+    # 2. xAI Grok 模式
+    elif provider == "xAI Grok":
+        url = "https://api.x.ai/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+
+        user_content = []
+        if image_b64:
+            user_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}})
+        user_content.append({"type": "text", "text": user_prompt})
+        messages.append({"role": "user", "content": user_content})
+
+        payload = {
+            "model": model_name or "grok-2-vision-1212",
+            "messages": messages,
+            "temperature": 0.3,
+        }
+        if response_json:
+            payload["response_format"] = {"type": "json_object"}
+
+        resp = requests.post(url, headers=headers, json=payload, timeout=60)
+        if resp.status_code != 200:
+            raise RuntimeError(f"Grok API 錯誤 ({resp.status_code}): {resp.text}")
+        return resp.json()["choices"][0]["message"]["content"]
+
+    # 3. OpenAI 模式
+    elif provider == "OpenAI":
+        url = "https://api.openai.com/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+
+        user_content = []
+        if image_b64:
+            user_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}})
+        user_content.append({"type": "text", "text": user_prompt})
+        messages.append({"role": "user", "content": user_content})
+
+        payload = {
+            "model": model_name or "gpt-4o",
+            "messages": messages,
+            "temperature": 0.3,
+        }
+        if response_json:
+            payload["response_format"] = {"type": "json_object"}
+
+        resp = requests.post(url, headers=headers, json=payload, timeout=60)
+        if resp.status_code != 200:
+            raise RuntimeError(f"OpenAI API 錯誤 ({resp.status_code}): {resp.text}")
+        return resp.json()["choices"][0]["message"]["content"]
+
+    else:
+        raise ValueError("不支援的模型供應商")
 
 # -----------------------------------------------------------------------------
-# 系統設定
+# 側邊欄設定
 # -----------------------------------------------------------------------------
-env_key = ""
-try:
-    env_key = st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY", ""))
-except Exception:
-    env_key = os.getenv("GEMINI_API_KEY", "")
-
 with st.sidebar:
     st.title("🎓 言昕的高中備考艙")
     active_nav = st.radio(
@@ -83,39 +168,69 @@ with st.sidebar:
         ["🏠 高中學習中樞 (Landing)", "📐 高中數理蘇格拉底解題", "🧬 高中學測自然探究", "📝 高中英文長難句與文法"],
     )
     st.markdown("---")
-    api_key = st.text_input("Gemini API Key", value=env_key, type="password")
+    st.subheader("🤖 AI 模型引擎設定")
+    
+    provider = st.selectbox(
+        "選擇 AI 供應商：",
+        ["Google Gemini", "xAI Grok", "OpenAI"],
+        index=0,
+    )
+
+    # 依選定之供應商讀取 Secrets 或預設值
+    if provider == "Google Gemini":
+        default_key = st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY", ""))
+        api_key = st.text_input("Gemini API Key：", value=default_key, type="password")
+        model_choice = st.selectbox("模型型號：", ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-pro"])
+    elif provider == "xAI Grok":
+        default_key = st.secrets.get("XAI_API_KEY", os.getenv("XAI_API_KEY", ""))
+        api_key = st.text_input("xAI Grok API Key：", value=default_key, type="password")
+        model_choice = st.selectbox("模型型號：", ["grok-2-vision-1212", "grok-2-1212"])
+    else:
+        default_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", ""))
+        api_key = st.text_input("OpenAI API Key：", value=default_key, type="password")
+        model_choice = st.selectbox("模型型號：", ["gpt-4o", "gpt-4o-mini"])
+
     if api_key:
-        st.caption("✅ 引擎就緒 (Gemini 3.8 Flash)")
-    st.markdown("---")
-    st.info("💡 提示：在 iPad Safari 點擊「分享 ⎋」➜「加入主畫面」，即可獲得全螢幕 App 體驗。")
-
-if not api_key:
-    st.warning("⚠️ 請先在左側確認或填入 Gemini API Key！")
-    st.stop()
-
-try:
-    client = genai.Client(api_key=api_key)
-    active_model = "gemini-3.8-flash"
-except Exception as e:
-    st.error(f"Client 初始化失敗: {e}")
-    st.stop()
+        st.success(f"✅ {provider} 已就緒")
 
 # =============================================================================
-# 頁面 1：高中學習中樞 (Landing Page)
+# 頁面 1：高中學習中樞 (Landing Page) + 2028 學測倒數計時
 # =============================================================================
 if active_nav == "🏠 高中學習中樞 (Landing)":
-    st.title("🎯 言昕的高中學測 / 分科戰情室")
-    st.caption("精準聚焦高中升學考科：數A/數B、學測自然、高中英文文法與題型深度引導")
+    # 計算 2028 年 1 月第二個週末 (2028/01/08 週六)
+    exam_date = date(2028, 1, 8)
+    today = date.today()
+    days_left = (exam_date - today).days
 
+    head_col1, head_col2 = st.columns([6, 4])
+    with head_col1:
+        st.title("🎯 言昕的高中學測 / 分科戰情室")
+        st.caption("精準聚焦高中升學考科：數A/數B、學測自然、高中英文文法與題型深度引導")
+
+    with head_col2:
+        st.markdown(
+            f"""
+            <div style="background: linear-gradient(135deg, #1e293b, #0f172a); border: 2px solid #38bdf8; border-radius: 14px; padding: 14px 20px; text-align: center; box-shadow: 0 4px 15px rgba(0,0,0,0.3);">
+                <div style="color: #94a3b8; font-size: 13px; font-weight: bold; letter-spacing: 1px;">⏳ 2028 年 1 月學測日倒數 (1/8 週六)</div>
+                <div style="font-size: 38px; font-weight: 900; color: #38bdf8; margin: 4px 0;">
+                    {days_left} <span style="font-size: 18px; color: #e2e8f0; font-weight: normal;">天</span>
+                </div>
+                <div style="color: #cbd5e1; font-size: 12px;">穩定每日節奏，紮實攻克每一道難題！</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("---")
     st.markdown("### 📚 高中專屬 NotebookLM 知識大腦")
-    st.caption("專屬大考筆記庫，點擊即可開啟專題研讀、來源回溯或生成音訊摘要：")
+    st.caption("點擊即可一鍵開啟專題筆記本研讀、考點回溯或收聽音訊摘要：")
 
     col1, col2, col3 = st.columns(3)
     with col1:
         st.markdown("""
         <div style="border:1px solid #3b82f6; border-radius:12px; padding:18px; background:#18181b; min-height:190px;">
             <h4 style="margin-top:0; color:#60a5fa;">📖 高中文法與寫作精煉</h4>
-            <p style="color:#a1a1aa; font-size:13px; line-height:1.5;">高中核心文法體系、常考倒裝/分詞構句、歷屆學測非選題考點。</p>
+            <p style="color:#a1a1aa; font-size:13px; line-height:1.5;">高中核心文法體系、倒裝/分詞構句、歷屆學測非選題考點。</p>
             <a href="https://gemini.google.com/notebook/8ed81913-6781-4162-841b-95f5e2ba19b5" target="_blank" style="display:inline-block; margin-top:10px; padding:6px 14px; background:#2563eb; color:white; border-radius:6px; text-decoration:none; font-size:13px; font-weight:bold;">開啟 英文筆記大腦 ↗</a>
         </div>
         """, unsafe_allow_html=True)
@@ -140,35 +255,32 @@ if active_nav == "🏠 高中學習中樞 (Landing)":
 
     st.markdown("---")
     st.markdown("### 🤖 高中各科 AI 家教艙")
-
     t1, t2, t3 = st.columns(3)
     with t1:
         st.subheader("📐 高中數理蘇格拉底解題")
-        st.write("• 拍下講義/模考幾何與代數難題")
-        st.write("• 後台 Python SymPy 方程求解防幻覺")
-        st.write("• 一次拋出一問，引導思考輔助線與定理")
+        st.write("• 拍照辨識題目，支援 SymPy 程式驗算")
+        st.write("• 一步步提問引導思考，不直接暴雷答案")
         st.caption("👉 左側選單切換至「高中數理蘇格拉底解題」")
-
     with t2:
         st.subheader("🧬 高中學測自然探究")
         st.write("• 著重大考實驗題：操作/應變/控制變因")
-        st.write("• 跨章節機制因果步驟鏈條梳理")
-        st.write("• 精確破除學測選項常見誘答陷阱")
+        st.write("• 梳理生物生理反應機制因果鏈")
         st.caption("👉 左側選單切換至「高中學測自然探究」")
-
     with t3:
         st.subheader("📝 高中英文長難句與文法")
-        st.write("• 3 秒拆解高中學測 4~5 行長難句成分")
-        st.write("• 標註主詞(S)、主要動詞(V)與分詞修飾")
-        st.write("• 作文句子升級為學測頂標句型")
+        st.write("• 拆解 4~5 行長難句：S + V + Modifier")
+        st.write("• 文法亮點剖析與頂標作文句型改寫")
         st.caption("👉 左側選單切換至「高中英文長難句與文法」")
 
 # =============================================================================
-# 頁面 2：高中數理蘇格拉底解題
+# 頁面 2：高中數理蘇格拉底解題 (支援多模型)
 # =============================================================================
 elif active_nav == "📐 高中數理蘇格拉底解題":
-    st.header("📐 高中數理蘇格拉底引導解題艙")
-    st.caption("適用高一~高三數學 (數A/數B)、物理，堅持「思考優先於公式」")
+    st.header(f"📐 高中數理蘇格拉底解題艙 ({provider}: {model_choice})")
+
+    if not api_key:
+        st.warning(f"⚠️ 請先在左側填入 **{provider}** 的 API Key！")
+        st.stop()
 
     if "math_messages" not in st.session_state:
         st.session_state.math_messages = []
@@ -205,7 +317,7 @@ elif active_nav == "📐 高中數理蘇格拉底解題":
     col_chat, col_tools = st.columns([6, 4])
 
     with col_tools:
-        st.subheader("🛠️ 後台運算監控與複習套件")
+        st.subheader("🛠️ 後台驗算監控與複習套件")
         if st.session_state.math_plan:
             plan = st.session_state.math_plan
             with st.expander("🔍 專家 Python SymPy 驗算紀錄", expanded=False):
@@ -215,20 +327,24 @@ elif active_nav == "📐 高中數理蘇格拉底解題":
                 st.info(f"求解輸出：{plan.get('execution_result', {}).get('stdout')}")
 
             if st.button("✨ 一鍵生成心智圖與觀念記憶卡", use_container_width=True, key="math_kit_btn"):
-                with st.spinner("AI 正在提煉高中考點心智圖與翻轉學習卡..."):
+                with st.spinner("AI 正在提煉考點心智圖與翻轉卡..."):
                     try:
                         kit_prompt = f"""
 根據高中數學題目：{plan.get('problem_statement')}：
-1. 產出 Mermaid.js 代碼（graph TD 開頭），梳理此題考查的高中核心公式、解題定理路徑與易錯陷阱。
-2. 產出 3 張「考點翻轉學習卡（Flashcards）」，每張包含正面問題（Front）與背面解答（Back）。
+1. 產出 Mermaid.js 代碼（graph TD 開頭），梳理公式、定理路徑與陷阱。
+2. 產出 3 張「考點翻轉學習卡（Flashcards）」。
 請直接輸出合法 JSON：
 {{"mermaid_code": "graph TD\\n...", "flashcards": [{{"front": "...", "back": "..."}}]}}
 """
-                        res = generate_content_with_retry(
-                            client, active_model, [kit_prompt],
-                            config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.3)
+                        kit_res = call_unified_llm(
+                            provider=provider,
+                            api_key=api_key,
+                            model_name=model_choice,
+                            system_prompt="",
+                            user_prompt=kit_prompt,
+                            response_json=True,
                         )
-                        st.session_state.math_kit = json.loads(res.text)
+                        st.session_state.math_kit = json.loads(kit_res)
                     except Exception as e:
                         st.error(f"生成失敗: {e}")
 
@@ -240,7 +356,7 @@ elif active_nav == "📐 高中數理蘇格拉底解題":
                 with tab2:
                     for i, card in enumerate(kit.get("flashcards", [])):
                         with st.expander(f"考點 {i+1}：{card.get('front')}"):
-                            st.info(f"**觀念核心：** {card.get('back')}")
+                            st.info(f"**解答：** {card.get('back')}")
         else:
             st.caption("👈 上傳高中題目發問後，此處將顯示 Python 後台驗算過程與觀念套件。")
 
@@ -260,56 +376,59 @@ elif active_nav == "📐 高中數理蘇格拉底解題":
                 st.markdown(prompt)
 
             try:
+                raw_bytes, b64_str = optimize_image_base64(st.session_state.math_image)
+                
                 if not st.session_state.math_plan:
-                    with st.status("🚀 啟動多代理人解題管線...", expanded=True) as status:
-                        status.write("📸 壓縮與辨識高中題目圖形...")
-                        img_bytes = optimize_image(st.session_state.math_image)
-                        image_part = types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg")
-
+                    with st.status(f"🚀 啟動多代理人解題管線 ({provider})...", expanded=True) as status:
+                        status.write("📸 辨識高中題目幾何與代數條件...")
                         solver_prompt = f"""
 你由兩位高中數學權威專家組成：
-1. 【櫃檯專家】：提取題目中的幾何圖形、向量、函數關係與條件數值。
-2. 【解題專家】：編寫嚴謹的 Python (sympy) 程式碼求解本題。
-請輸出合法 JSON：
+1. 【櫃檯專家】：提取題目中的幾何圖形、向量、函數關係與條件數值。使用者指示：{prompt}
+2. 【解題專家】：編寫嚴謹的 Python (sympy) 程式碼求解驗算。
+請直接輸出合法 JSON：
 {{
     "problem_statement": "題目文字描述與條件摘要",
-    "python_code": "import sympy as sp...",
+    "python_code": "import sympy as sp\\n...",
     "expected_answer": "最終答案",
     "solution_steps": ["步驟1...", "步驟2...", "步驟3..."]
 }}
 """
                         status.write("🧠 編寫 Python 算式並於沙盒驗算...")
-                        res = generate_content_with_retry(
-                            client, active_model, [image_part, solver_prompt],
-                            config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.2)
+                        res_text = call_unified_llm(
+                            provider=provider,
+                            api_key=api_key,
+                            model_name=model_choice,
+                            system_prompt="",
+                            user_prompt=solver_prompt,
+                            image_b64=b64_str,
+                            image_bytes=raw_bytes,
+                            response_json=True,
                         )
-                        plan_data = json.loads(res.text)
-                        status.write("⚡ 執行 SymPy 代數運算...")
+                        # 清理可能夾帶的 markdown 標記
+                        clean_json = re.sub(r"^```json\s*", "", res_text.strip(), flags=re.MULTILINE)
+                        clean_json = re.sub(r"^```\s*$", "", clean_json.strip(), flags=re.MULTILINE)
+                        plan_data = json.loads(clean_json)
+
+                        status.write("⚡ 執行 SymPy 方程求解...")
                         plan_data["execution_result"] = execute_sympy_code(plan_data.get("python_code", ""))
                         st.session_state.math_plan = plan_data
                         status.update(label="✅ 後台題目驗算與步驟拆解完成！", state="complete", expanded=False)
 
                 with st.spinner("🤔 家教正在思考高中教學引導步驟..."):
                     sys_inst = f"""
-你是一位親切、循循善誘的頂尖高中數學「蘇格拉底家教」。
-【後台驗證之標準解法資訊】：
-- 題目：{st.session_state.math_plan.get('problem_statement')}
-- 驗算最終答案：{st.session_state.math_plan.get('expected_answer')}
-- 步驟拆解：{json.dumps(st.session_state.math_plan.get('solution_steps'), ensure_ascii=False)}
-
-【教學準則】：
-1. 嚴禁直接透露答案或整串算式！
-2. 根據對話進度，一次只問一個關鍵問題（例如：是否需要做輔助線、該用正弦還是餘弦定理）。
-3. 學生回答正確時給予鼓勵並推進；學生答錯或卡住時，將問題拆得更直觀。
-4. 數學符號使用標準 LaTeX（如 $\\vec{{AB}}$, $\\sin\\theta$, $\\sqrt{{3}}$）。
+你是一位親切的高中數學蘇格拉底家教。
+【驗算答案】：{st.session_state.math_plan.get('expected_answer')}
+【步驟拆解】：{json.dumps(st.session_state.math_plan.get('solution_steps'), ensure_ascii=False)}
+【原則】：嚴禁直接給答案；一次只問一個關鍵小問題引導思考；若學生答錯則拆解步驟；數學符號用 LaTeX。
 """
-                    chat_history = [f"{m['role']}: {m['content']}" for m in st.session_state.math_messages[:-1]]
-                    chat_history.append(f"user: {prompt}")
-                    reply_res = generate_content_with_retry(
-                        client, active_model, chat_history,
-                        config=types.GenerateContentConfig(system_instruction=sys_inst, temperature=0.4)
+                    conv = "\n".join([f"{m['role']}: {m['content']}" for m in st.session_state.math_messages])
+                    reply = call_unified_llm(
+                        provider=provider,
+                        api_key=api_key,
+                        model_name=model_choice,
+                        system_prompt=sys_inst,
+                        user_prompt=conv,
                     )
-                    reply = reply_res.text
 
                 with st.chat_message("assistant"):
                     st.markdown(reply)
@@ -323,8 +442,12 @@ elif active_nav == "📐 高中數理蘇格拉底解題":
 # 頁面 3：高中學測自然探究
 # =============================================================================
 elif active_nav == "🧬 高中學測自然探究":
-    st.header("🧬 高中學測自然探究與生物家教")
+    st.header(f"🧬 高中學測自然探究與生物家教 ({provider}: {model_choice})")
     st.caption("專注於：實驗探究變因、折線/柱狀圖判讀、生理反應步驟鏈條、大考誘答選項破解")
+
+    if not api_key:
+        st.warning(f"⚠️ 請先在左側填入 **{provider}** 的 API Key！")
+        st.stop()
 
     if "bio_messages" not in st.session_state:
         st.session_state.bio_messages = []
@@ -333,38 +456,39 @@ elif active_nav == "🧬 高中學測自然探究":
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    if bio_prompt := st.chat_input("輸入你想詢問的學測自然題目或觀念（例如：光反應與碳反應的物質轉移 / 動作電位去極化與再極化離子通道變化）"):
+    if bio_prompt := st.chat_input("輸入你想詢問的學測自然題目或觀念（例如：光反應與碳反應的物質轉移 / 動作電位傳導）"):
         st.session_state.bio_messages.append({"role": "user", "content": bio_prompt})
         with st.chat_message("user"):
             st.markdown(bio_prompt)
 
         with st.spinner("🔬 正在梳理高中課綱機制與因果鏈..."):
-            bio_sys = """
-你是一位頂尖高中學測自然科（生物/物理/化學）名師：
-1. 嚴格對齊高中 108 課綱範圍，不使用超出課綱的大學專有名詞。
-2. 遇到生理機能或化學反應，使用因果步驟鏈 (步驟 1 ➔ 步驟 2 ➔ 步驟 3) 清晰呈現。
-3. 遇到易混淆觀念，製作對照 Markdown 表格。
-4. 特別標註「學測最常見陷阱選項與關鍵誘答字眼」。
-"""
-            chat_hist = [f"{m['role']}: {m['content']}" for m in st.session_state.bio_messages[:-1]]
-            chat_hist.append(f"user: {bio_prompt}")
-            bio_res = generate_content_with_retry(
-                client, active_model, chat_hist,
-                config=types.GenerateContentConfig(system_instruction=bio_sys, temperature=0.3)
-            )
-            b_reply = bio_res.text
-
-        with st.chat_message("assistant"):
-            st.markdown(b_reply)
-        st.session_state.bio_messages.append({"role": "assistant", "content": b_reply})
-        st.rerun()
+            try:
+                bio_sys = "你是一位高中學測自然名師：請用清晰步驟鏈 (1 -> 2 -> 3) 說明機制，並標註大考常見陷阱選項。"
+                conv = "\n".join([f"{m['role']}: {m['content']}" for m in st.session_state.bio_messages])
+                b_reply = call_unified_llm(
+                    provider=provider,
+                    api_key=api_key,
+                    model_name=model_choice,
+                    system_prompt=bio_sys,
+                    user_prompt=conv,
+                )
+                with st.chat_message("assistant"):
+                    st.markdown(b_reply)
+                st.session_state.bio_messages.append({"role": "assistant", "content": b_reply})
+                st.rerun()
+            except Exception as e:
+                st.error(f"⚠️ 發生錯誤：{e}")
 
 # =============================================================================
 # 頁面 4：高中英文長難句與文法
 # =============================================================================
 elif active_nav == "📝 高中英文長難句與文法":
-    st.header("📝 高中英文長難句與大考文法家教")
-    st.caption("專門解決高中學測閱讀測驗長難句、克漏字時態與英文作文句型升級")
+    st.header(f"📝 高中英文長難句與大考文法家教 ({provider}: {model_choice})")
+    st.caption("專門解決高中學測長難句拆解、文法盲點與寫作句型升級")
+
+    if not api_key:
+        st.warning(f"⚠️ 請先在左側填入 **{provider}** 的 API Key！")
+        st.stop()
 
     if "eng_messages" not in st.session_state:
         st.session_state.eng_messages = []
@@ -373,27 +497,25 @@ elif active_nav == "📝 高中英文長難句與文法":
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    if eng_prompt := st.chat_input("貼上一句高中文長難句，或貼上想優化的英文作文段落："):
+    if eng_prompt := st.chat_input("貼上一句高中文長難句，或想優化的作文句子："):
         st.session_state.eng_messages.append({"role": "user", "content": eng_prompt})
         with st.chat_message("user"):
             st.markdown(eng_prompt)
 
         with st.spinner("📖 正在拆解高中句子成分與語法亮點..."):
-            eng_sys = """
-你是一位高中學測英文金牌導師：
-1. 【句子結構拆解】：標明【主詞 Subject】、【主要動詞 Verb】、【修飾語/副詞子句/分詞構句 Modifier】。
-2. 【高中關鍵語法】：指出句中包含的高中重點文法（例如：關係代名詞、分詞構句、倒裝句、虛擬語氣）。
-3. 【大考寫作應用】：提供 1~2 個學測頂標作文句型改寫範例。
-"""
-            chat_hist = [f"{m['role']}: {m['content']}" for m in st.session_state.eng_messages[:-1]]
-            chat_hist.append(f"user: {eng_prompt}")
-            eng_res = generate_content_with_retry(
-                client, active_model, chat_hist,
-                config=types.GenerateContentConfig(system_instruction=eng_sys, temperature=0.3)
-            )
-            e_reply = eng_res.text
-
-        with st.chat_message("assistant"):
-            st.markdown(e_reply)
-        st.session_state.eng_messages.append({"role": "assistant", "content": e_reply})
-        st.rerun()
+            try:
+                eng_sys = "你是一位高中英文名師：請拆解句子【主詞 S】、【主要動詞 V】、【修飾語 Modifier】，指出核心文法並提供 1~2 個學測頂標句型範例。"
+                conv = "\n".join([f"{m['role']}: {m['content']}" for m in st.session_state.eng_messages])
+                e_reply = call_unified_llm(
+                    provider=provider,
+                    api_key=api_key,
+                    model_name=model_choice,
+                    system_prompt=eng_sys,
+                    user_prompt=conv,
+                )
+                with st.chat_message("assistant"):
+                    st.markdown(e_reply)
+                st.session_state.eng_messages.append({"role": "assistant", "content": e_reply})
+                st.rerun()
+            except Exception as e:
+                st.error(f"⚠️ 發生錯誤：{e}")
