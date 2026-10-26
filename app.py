@@ -27,8 +27,7 @@ st.set_page_config(
 # -----------------------------------------------------------------------------
 # 圖片處理與 SymPy 驗算沙盒
 # -----------------------------------------------------------------------------
-def optimize_image_base64(img: Image.Image, max_dim: int = 1280) -> tuple[bytes, str]:
-    """將圖片等比壓縮並產出 bytes 與 base64 字串"""
+def optimize_image_base64(img: Image.Image, max_dim: int = 1280):
     if img.mode != "RGB":
         img = img.convert("RGB")
     w, h = img.size
@@ -44,7 +43,7 @@ def optimize_image_base64(img: Image.Image, max_dim: int = 1280) -> tuple[bytes,
     return raw_bytes, b64_str
 
 def execute_sympy_code(code_str: str) -> dict:
-    clean_code = re.sub(r"^```python\s*", "", code_str, flags=re.MULTILINE)
+    clean_code = re.sub(r"^```(?:python)?\s*", "", code_str, flags=re.MULTILINE)
     clean_code = re.sub(r"^```\s*$", "", clean_code, flags=re.MULTILINE)
     stdout_capture = io.StringIO()
     exec_globals = {"sp": sp, "sympy": sp, "symbols": sp.symbols, "Eq": sp.Eq, "solve": sp.solve, "sqrt": sp.sqrt}
@@ -57,7 +56,7 @@ def execute_sympy_code(code_str: str) -> dict:
         return {"success": False, "stdout": stdout_capture.getvalue().strip(), "code": clean_code.strip(), "error": str(e)}
 
 # -----------------------------------------------------------------------------
-# 跨平台 Multi-LLM 統一呼叫引擎 (Gemini / Grok / OpenAI)
+# 跨平台 Multi-LLM 統一呼叫引擎
 # -----------------------------------------------------------------------------
 def call_unified_llm(
     provider: str,
@@ -69,9 +68,7 @@ def call_unified_llm(
     image_bytes: bytes = None,
     response_json: bool = False,
 ) -> str:
-    """統一封裝 Google Gemini、xAI Grok 與 OpenAI 的請求"""
-    
-    # 1. Google Gemini 模式
+    # 1. Google Gemini 模式 (鎖定官方指定之 gemini-3.8-flash)
     if provider == "Google Gemini":
         client = genai.Client(api_key=api_key)
         contents = []
@@ -85,21 +82,22 @@ def call_unified_llm(
         if response_json:
             cfg_args["response_mime_type"] = "application/json"
 
-        # 優先清單輪詢防 503/404
-        candidates = [model_name, "gemini-2.5-flash", "gemini-2.0-flash"]
-        last_err = None
-        for m in candidates:
+        # 優先呼叫選擇之模型，若 503 high demand 則自動退避重試
+        target_model = model_name or "gemini-3.8-flash"
+        for attempt in range(3):
             try:
                 res = client.models.generate_content(
-                    model=m,
+                    model=target_model,
                     contents=contents,
                     config=types.GenerateContentConfig(**cfg_args),
                 )
                 return res.text
             except Exception as e:
-                last_err = e
-                time.sleep(1)
-        raise last_err
+                err_text = str(e)
+                if "503" in err_text or "UNAVAILABLE" in err_text or "high demand" in err_text.lower():
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                raise e
 
     # 2. xAI Grok 模式
     elif provider == "xAI Grok":
@@ -176,11 +174,10 @@ with st.sidebar:
         index=0,
     )
 
-    # 依選定之供應商讀取 Secrets 或預設值
     if provider == "Google Gemini":
         default_key = st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY", ""))
         api_key = st.text_input("Gemini API Key：", value=default_key, type="password")
-        model_choice = st.selectbox("模型型號：", ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-pro"])
+        model_choice = st.selectbox("模型型號：", ["gemini-3.8-flash"])
     elif provider == "xAI Grok":
         default_key = st.secrets.get("XAI_API_KEY", os.getenv("XAI_API_KEY", ""))
         api_key = st.text_input("xAI Grok API Key：", value=default_key, type="password")
@@ -273,7 +270,7 @@ if active_nav == "🏠 高中學習中樞 (Landing)":
         st.caption("👉 左側選單切換至「高中英文長難句與文法」")
 
 # =============================================================================
-# 頁面 2：高中數理蘇格拉底解題 (支援多模型)
+# 頁面 2：高中數理蘇格拉底解題
 # =============================================================================
 elif active_nav == "📐 高中數理蘇格拉底解題":
     st.header(f"📐 高中數理蘇格拉底解題艙 ({provider}: {model_choice})")
@@ -344,7 +341,9 @@ elif active_nav == "📐 高中數理蘇格拉底解題":
                             user_prompt=kit_prompt,
                             response_json=True,
                         )
-                        st.session_state.math_kit = json.loads(kit_res)
+                        clean_json = re.sub(r"^```(?:json)?\s*", "", kit_res.strip(), flags=re.MULTILINE)
+                        clean_json = re.sub(r"^```\s*$", "", clean_json.strip(), flags=re.MULTILINE)
+                        st.session_state.math_kit = json.loads(clean_json)
                     except Exception as e:
                         st.error(f"生成失敗: {e}")
 
@@ -404,8 +403,7 @@ elif active_nav == "📐 高中數理蘇格拉底解題":
                             image_bytes=raw_bytes,
                             response_json=True,
                         )
-                        # 清理可能夾帶的 markdown 標記
-                        clean_json = re.sub(r"^```json\s*", "", res_text.strip(), flags=re.MULTILINE)
+                        clean_json = re.sub(r"^```(?:json)?\s*", "", res_text.strip(), flags=re.MULTILINE)
                         clean_json = re.sub(r"^```\s*$", "", clean_json.strip(), flags=re.MULTILINE)
                         plan_data = json.loads(clean_json)
 
